@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import threading
 import time
 import inspect
 import hashlib
@@ -37,6 +38,13 @@ class Autotuner(KernelInterface):
         self.cache: Dict[Tuple, Config] = {}
         self.arg_names = arg_names
         self.cache_results = (cache_results or knobs.autotuning.cache) and not knobs.runtime.interpret
+
+        # `nargs` is kept in thread-local storage so that concurrent run()/warmup()
+        # calls from different threads each see their own arguments. Storing it
+        # directly on `self` made the first thread to finish a cold-cache autotune
+        # reset `nargs` to None while another thread was still benchmarking
+        # (https://github.com/triton-lang/triton/issues/11494).
+        self._tls = threading.local()
 
         # Reset to zero or restore values
         self.reset_to_zero = []
@@ -123,6 +131,28 @@ class Autotuner(KernelInterface):
                 quantiles=quantiles,
             )
             return
+
+    @property
+    def nargs(self):
+        """Arguments of the current run()/warmup() call, kept per-thread."""
+        tls = getattr(self, "_tls", None)
+        return getattr(tls, "nargs", None) if tls is not None else None
+
+    @nargs.setter
+    def nargs(self, value):
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
+        self._tls.nargs = value
+
+    def __getstate__(self):
+        # threading.local is not picklable; it is recreated lazily on the next
+        # nargs access after unpickling.
+        state = self.__dict__.copy()
+        state.pop("_tls", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     @cached_property
     def do_bench(self):

@@ -667,3 +667,76 @@ def test_prune_all_configs(device):
         assert e is not None and str(
             e
         ) == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Concurrent autotuning test requires CUDA")
+def test_autotune_thread_safety(device):
+    """
+    Two threads autotuning the same kernel concurrently must not crash.
+
+    Regression test for https://github.com/triton-lang/triton/issues/11494:
+    the first thread to finish its cold-cache benchmark resets ``Autotuner.nargs``
+    to None, while the other thread is still reading it inside its own benchmark.
+    """
+    import threading
+
+    tls = threading.local()
+    first_in_bench = threading.Event()
+    second_done = threading.Event()
+
+    def do_bench(kernel_call, quantiles):
+        if getattr(tls, "first", False):
+            # Park the first thread inside its benchmark...
+            first_in_bench.set()
+            assert second_done.wait(timeout=30), "timed out waiting for the second thread to finish"
+        else:
+            # ...and only let the second thread finish once the first one is
+            # parked, so that the second thread's `nargs = None` reset always
+            # happens while the first thread is still benchmarking. This
+            # deterministically reproduces the cross-thread nargs race.
+            assert first_in_bench.wait(timeout=30), "timed out waiting for the first thread to start"
+            kernel_call()
+        return [1.0, 0.9, 1.1]
+
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 64}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+
+    @triton.autotune(configs=configs, key=['N'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    def first_thread():
+        tls.first = True
+        src = torch.randn(4096, device=device)
+        dst = torch.empty(4096, device=device)
+        _kernel[(64, )](dst, src, N=4096)
+        torch.testing.assert_close(dst, src)
+
+    def second_thread():
+        src = torch.randn(8192, device=device)
+        dst = torch.empty(8192, device=device)
+        # A different key, so both threads enter the (cold) benchmark path.
+        _kernel[(128, )](dst, src, N=8192)
+        torch.testing.assert_close(dst, src)
+        second_done.set()
+
+    errors = []
+
+    def run_thread(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=run_thread, args=(first_thread, )),
+        threading.Thread(target=run_thread, args=(second_thread, ))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert all(not t.is_alive() for t in threads), "concurrent autotuning threads did not terminate"
+    assert not errors, f"concurrent autotuning failed: {errors[0]!r}"
